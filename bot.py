@@ -12,12 +12,12 @@ import logging
 from bs4 import BeautifulSoup
 
 # -------------------- Налаштування -------------------- #
-BOT_TOKEN = "7901787835:AAH_FD1b4_PEZmsbvAyopzPfkuPRllzJpp8"  # Вкажіть тут свій справжній токен бота
+BOT_TOKEN = "TOKEN"  # Вкажіть тут свій справжній токен бота
 DB_PATH = "products.db"  # Ім'я файлу бази даних
 
 # Якщо TESTING=True, для тестування оновлення надсилатимуться кожну хвилину;
 # Якщо TESTING=False, оновлення будуть надсилатися щодня у встановлений час.
-TESTING = True
+TESTING = False
 
 logging.basicConfig(level=logging.INFO)
 
@@ -214,13 +214,12 @@ def parse_price(price_text: str):
 # -------------------- Обробники команд бота -------------------- #
 @dp.message(Command("start", "help"))
 async def send_welcome(message: types.Message):
-    # Привітальне повідомлення, яке пояснює основні команди бота
     welcome_text = (
         "Ласкаво просимо!\n\n"
         "Доступні команди:\n"
         "• /add <url> — Додати продукт для відстеження.\n"
         "• /delete <url> — Видалити продукт із відстеження.\n"
-        "• /check <url> — Перевірити актуальні дані продукту (оновлює запис).\n"
+        "• /check [<url>] — Перевірити актуальні дані продукту (якщо URL не вказано, перевіряються всі відстежувані продукти).\n"
         "• /list — Показати всі продукти, які ви відстежуєте.\n"
         "• /settime <HH:MM> — Встановити час для щоденних оновлень.\n\n"
         "При кожному оновленні даних інформація та час зберігаються."
@@ -295,52 +294,103 @@ async def delete_handler(message: types.Message):
 async def check_handler(message: types.Message):
     """
     Перевіряємо актуальні дані продукту.
-    Формат команди: /check <url>
-    Скрейпимо сторінку, оновлюємо запис у базі і повертаємо інформацію разом із відсотковою зміною ціни.
+    Якщо ви вкажете URL, бот оновить інформацію для цього продукту.
+    Якщо URL не задано, бот перевірить усі продукти, які ви відстежуєте.
     """
     parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply("Будь ласка, введіть команду у форматі: /check <url>")
-        return
-
-    url = parts[1].strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        await message.reply("Переконайтеся, що URL починається з http:// або https://")
-        return
-
-    product = get_tracked_product(message.from_user.id, url)
-    if product is None:
-        await message.reply("Продукт не знайдено у вашому списку відстеження. Спочатку додайте його за допомогою /add.")
-        return
-
-    site = detect_site(url)
-    if not site:
-        await message.reply("Невідомий сайт.")
-        return
-
-    config = SCRAPING_CONFIG[site]
     loop = asyncio.get_running_loop()
-    title, price_text, timestamp = await loop.run_in_executor(None, scrape_custom, url, config)
-    if title is None or price_text is None:
-        await message.reply("Не вдалося отримати дані зі сторінки. Перевірте, будь ласка, посилання.")
-        return
 
-    price = parse_price(price_text)
-    if price is None:
-        await message.reply("Не вдалося визначити ціну.")
-        return
+    # Якщо URL не вказано – беремо всі продукти користувача
+    if len(parts) < 2:
+        products = get_products_for_user(message.from_user.id)
+        if not products:
+            await message.reply("У вас немає відстежуваних продуктів. Додайте продукт командою /add <url>.")
+            return
 
-    old_price = parse_price(product[2])
-    if old_price:
-        price_change = ((price - old_price) / old_price) * 100
+        results = []
+        for prod in products:
+            prod_id, url, old_title, old_price, old_timestamp = prod
+            site = detect_site(url)
+            if not site:
+                results.append(f"URL: {url} - невідомий сайт.")
+                continue
+
+            config = SCRAPING_CONFIG[site]
+            # Робимо асинхронний виклик функції скрейпінгу для даного продукту
+            title, price_text, timestamp = await loop.run_in_executor(None, scrape_custom, url, config)
+            if title is None or price_text is None:
+                results.append(f"URL: {url} - не вдалося отримати дані.")
+                continue
+
+            price = parse_price(price_text)
+            if price is None:
+                results.append(f"URL: {url} - не вдалося визначити ціну.")
+                continue
+
+            old_price_val = parse_price(old_price)
+            if old_price_val:
+                price_change = ((price - old_price_val) / old_price_val) * 100
+            else:
+                price_change = 0
+
+            # Оновлюємо інформацію про продукт у базі
+            update_tracked_product(prod_id, title, str(price), timestamp)
+
+            # Формуємо рядок з результатами для цього продукту
+            results.append(
+                f"URL: {url}\n"
+                f"Заголовок: {title}\n"
+                f"Ціна: {price} грн\n"
+                f"Зміна: {price_change:+.2f}%\n"
+                f"Оновлено: {timestamp}"
+            )
+
+        await message.reply("\n\n".join(results))
+
+    # Якщо URL задано – працюємо тільки з цим продуктом
     else:
-        price_change = 0
+        url = parts[1].strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await message.reply("Будь ласка, надайте коректну URL (починається з http:// або https://).")
+            return
 
-    update_tracked_product(product[0], title, str(price), timestamp)
-    await message.reply(
-        f"Актуальні дані:\nURL: {url}\nЗаголовок: {title}\nЦіна: {price} грн\n"
-        f"Зміна: {price_change:+.2f}%\nОновлено: {timestamp}"
-    )
+        product = get_tracked_product(message.from_user.id, url)
+        if product is None:
+            await message.reply("Продукт не знайдено у вашому списку відстеження. Спочатку додайте його через /add.")
+            return
+
+        site = detect_site(url)
+        if not site:
+            await message.reply("Невідомий сайт.")
+            return
+
+        config = SCRAPING_CONFIG[site]
+        title, price_text, timestamp = await loop.run_in_executor(None, scrape_custom, url, config)
+        if title is None or price_text is None:
+            await message.reply("Не вдалося отримати дані зі сторінки. Перевірте, будь ласка, посилання.")
+            return
+
+        price = parse_price(price_text)
+        if price is None:
+            await message.reply("Не вдалося визначити ціну.")
+            return
+
+        old_price_val = parse_price(product[2])
+        if old_price_val:
+            price_change = ((price - old_price_val) / old_price_val) * 100
+        else:
+            price_change = 0
+
+        update_tracked_product(product[0], title, str(price), timestamp)
+        await message.reply(
+            f"Актуальні дані:\n"
+            f"URL: {url}\n"
+            f"Заголовок: {title}\n"
+            f"Ціна: {price} грн\n"
+            f"Зміна: {price_change:+.2f}%\n"
+            f"Оновлено: {timestamp}"
+        )
+
 
 @dp.message(Command("list"))
 async def list_handler(message: types.Message):
